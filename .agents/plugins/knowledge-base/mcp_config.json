@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "knowledge-base": {
+      "command": "python",
+      "args": ["mcp_launcher.py"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONPATH": "."
+      }
+    }
+  }
+}

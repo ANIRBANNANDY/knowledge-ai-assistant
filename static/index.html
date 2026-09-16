@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Knowledge AI Assistant | Bitbucket Cloud Docs</title>
+    <meta name="description" content="Local Zero-API-Key Knowledge AI Chatbot powered by Hybrid RAG & Gemini 3.7 Flash">
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <!-- Markdown Parser -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app-shell">
+        <!-- Sidebar Navigation -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="brand-logo">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+                    </svg>
+                </div>
+                <div class="brand-text">
+                    <h2>Knowledge AI</h2>
+                    <span class="badge-gemini">Gemini 3.7 Flash</span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" id="tab-btn-chat" data-tab="chat">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                    </svg>
+                    <span>Chat Assistant</span>
+                </button>
+                <button class="nav-item" id="tab-btn-search" data-tab="search">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"/>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    <span>Hybrid Search</span>
+                </button>
+                <button class="nav-item" id="tab-btn-sources" data-tab="sources">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+                        <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+                    </svg>
+                    <span>Knowledge Hub</span>
+                </button>
+                <button class="nav-item" id="tab-btn-ingest" data-tab="ingest">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"/>
+                        <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                    <span>Ingest URLs</span>
+                </button>
+                <button class="nav-item" id="tab-btn-logs" data-tab="logs">
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="4 17 10 11 4 5"/>
+                        <line x1="12" y1="19" x2="20" y2="19"/>
+                    </svg>
+                    <span>Activity & MCP Logs</span>
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <div class="stats-card">
+                    <div class="stats-row">
+                        <span class="label">Documents:</span>
+                        <strong id="stat-docs" class="val">-</strong>
+                    </div>
+                    <div class="stats-row">
+                        <span class="label">Chunks:</span>
+                        <strong id="stat-chunks" class="val">-</strong>
+                    </div>
+                    <div class="stats-row">
+                        <span class="label">Words:</span>
+                        <strong id="stat-words" class="val">-</strong>
+                    </div>
+                    <div class="status-indicator">
+                        <span class="status-dot"></span>
+                        <span class="status-text">MCP & RAG Active</span>
+                    </div>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Header Bar -->
+            <header class="top-header">
+                <div class="header-left">
+                    <h1 id="page-title">Documentation AI Assistant</h1>
+                    <p id="page-desc">Ask questions grounded in your local Atlassian Bitbucket Cloud knowledge base</p>
+                </div>
+                <div class="header-right">
+                    <div class="model-badge">
+                        <span class="pulse-ring"></span>
+                        <span class="engine-label">MCP Server:</span>
+                        <strong>Active (stdio)</strong>
+                    </div>
+                </div>
+            </header>
+
+            <!-- TAB 1: CHAT ASSISTANT -->
+            <section class="tab-pane active" id="pane-chat">
+                <div class="chat-container">
+                    <div class="chat-messages" id="chat-messages">
+                        <div class="message assistant-msg welcome-card">
+                            <div class="avatar">🤖</div>
+                            <div class="msg-body">
+                                <h3>Welcome to your Grounded Knowledge AI!</h3>
+                                <p>All answers are strictly grounded in your indexed documentation with zero hallucination. Try these questions:</p>
+                                <div class="quick-questions">
+                                    <button class="chip" onclick="askPreset('What is a Bitbucket workspace?')">What is a workspace?</button>
+                                    <button class="chip" onclick="askPreset('What happens if I change my workspace ID?')">Changing Workspace ID</button>
+                                    <button class="chip" onclick="askPreset('How do I create a workspace in Atlassian Administration?')">Create in Atlassian Admin</button>
+                                    <button class="chip" onclick="askPreset('Who can invite users and grant access?')">User Invitations & Access</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="chat-input-area">
+                        <form id="chat-form" class="chat-form" onsubmit="handleChatSubmit(event)">
+                            <input 
+                                type="text" 
+                                id="chat-input" 
+                                placeholder="Ask a question about your indexed documentation..." 
+                                autocomplete="off"
+                                required
+                            />
+                            <button type="submit" id="chat-send-btn" class="send-btn">
+                                <span>Send</span>
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="22" y1="2" x2="11" y2="13"/>
+                                    <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                                </svg>
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 2: HYBRID SEARCH & EXPLORER -->
+            <section class="tab-pane" id="pane-search">
+                <div class="search-panel">
+                    <div class="search-header-box">
+                        <div class="search-input-group">
+                            <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="11" cy="11" r="8"/>
+                                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                            </svg>
+                            <input 
+                                type="text" 
+                                id="search-query-input" 
+                                placeholder="Type keywords or question (e.g., 'Atlassian Administration user invites')..." 
+                                onkeydown="if(event.key==='Enter') executeSearch()"
+                            />
+                            <button class="btn btn-primary" onclick="executeSearch()">Search</button>
+                        </div>
+                        <div class="search-controls">
+                            <label>Top K Chunks: <span id="top-k-val">6</span></label>
+                            <input type="range" id="search-top-k" min="1" max="12" value="6" oninput="document.getElementById('top-k-val').innerText = this.value">
+                        </div>
+                    </div>
+
+                    <div id="search-results-container" class="search-results-list">
+                        <div class="empty-state">
+                            <p>Enter a query above to test hybrid BM25 + Vector cosine retrieval and inspect ranked chunks.</p>
+                        </div>
+                    </div>
+
+                    <div id="prompt-preview-box" class="prompt-preview-card" style="display:none;">
+                        <div class="card-header">
+                            <h4>Formatted Grounded Prompt for Gemini 3.7 Flash</h4>
+                            <button class="btn btn-sm btn-outline" onclick="copyFormattedPrompt()">Copy Prompt</button>
+                        </div>
+                        <pre id="prompt-preview-text"></pre>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 3: KNOWLEDGE HUB (SOURCES) -->
+            <section class="tab-pane" id="pane-sources">
+                <div class="sources-panel">
+                    <div class="sources-header">
+                        <h3>Indexed Knowledge Documents</h3>
+                        <button class="btn btn-secondary" onclick="loadSources()">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="23 4 23 10 17 10"/>
+                                <polyline points="1 20 1 14 7 14"/>
+                                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                            </svg>
+                            Refresh
+                        </button>
+                    </div>
+
+                    <div class="sources-grid" id="sources-grid">
+                        <!-- Loaded dynamically -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 4: INGEST URLS -->
+            <section class="tab-pane" id="pane-ingest">
+                <div class="ingest-panel">
+                    <div class="ingest-card">
+                        <h3>Scrape & Index Web Documentation</h3>
+                        <p>Enter URLs (one per line). The scraper will automatically fetch content, clean headings, extract JSON-LD schemas, generate overlapping chunks, and update the hybrid search index.</p>
+
+                        <div class="quick-presets">
+                            <span class="preset-label">Quick Presets:</span>
+                            <button class="btn btn-xs btn-outline" onclick="setBitbucketPreset()">Fill Default 3 Bitbucket URLs</button>
+                        </div>
+
+                        <textarea 
+                            id="ingest-urls-textarea" 
+                            rows="6" 
+                            placeholder="https://support.atlassian.com/bitbucket-cloud/docs/what-is-a-workspace/&#10;https://support.atlassian.com/bitbucket-cloud/docs/create-your-workspace/&#10;https://support.atlassian.com/bitbucket-cloud/docs/grant-access-to-a-workspace/"
+                        ></textarea>
+
+                        <div class="ingest-actions">
+                            <button class="btn btn-primary" id="ingest-submit-btn" onclick="submitIngest()">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                                    <polyline points="7 10 12 15 17 10"/>
+                                    <line x1="12" y1="15" x2="12" y2="3"/>
+                                </svg>
+                                Start Scraping & Indexing
+                            </button>
+                        </div>
+
+                        <div id="ingest-status-log" class="ingest-logs" style="display:none;">
+                            <h4>Ingestion Progress:</h4>
+                            <div id="ingest-log-content"></div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- TAB 5: ACTIVITY & MCP LOGS (NEW) -->
+            <section class="tab-pane" id="pane-logs">
+                <div class="logs-panel">
+                    <div class="logs-header-box">
+                        <div class="logs-header-left">
+                            <h3>Real-Time MCP & Process Logs</h3>
+                            <p>Live stream of Gemini LLM interactions, MCP JSON-RPC tool calls, RAG search latency, and Web requests.</p>
+                        </div>
+                        <div class="logs-header-right">
+                            <div class="filter-group">
+                                <label>Category:</label>
+                                <select id="log-category-select" onchange="loadLogs()">
+                                    <option value="">All Categories</option>
+                                    <option value="MCP">MCP (Gemini Tool Calls)</option>
+                                    <option value="RAG">RAG (Hybrid Search)</option>
+                                    <option value="WEB">Web Activity</option>
+                                    <option value="SCRAPER">Scraper & Ingestion</option>
+                                </select>
+                            </div>
+                            <button class="btn btn-sm btn-secondary" onclick="loadLogs()">
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <polyline points="23 4 23 10 17 10"/>
+                                    <polyline points="1 20 1 14 7 14"/>
+                                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                                </svg>
+                                Refresh
+                            </button>
+                            <button class="btn btn-sm btn-danger" onclick="clearAllLogs()">Clear</button>
+                        </div>
+                    </div>
+
+                    <div class="logs-terminal" id="logs-terminal">
+                        <div class="empty-state"><p>Loading activity logs...</p></div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Document Detail Modal -->
+    <div class="modal-overlay" id="doc-modal" style="display:none;" onclick="if(event.target===this) closeModal()">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modal-title">Document Details</h3>
+                <button class="modal-close" onclick="closeModal()">&times;</button>
+            </div>
+            <div class="modal-meta" id="modal-meta"></div>
+            <div class="modal-body" id="modal-body"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
