@@ -31,6 +31,8 @@ async function safeFetchJson(url, options = {}) {
 
 document.addEventListener("DOMContentLoaded", () => {
     initTabs();
+    initTextSize();
+    setupDropZone();
     loadStatus();
     loadSources();
 });
@@ -97,6 +99,33 @@ function initTabs() {
     });
 }
 
+// State
+let activeLlmModel = "gemma4:12b";
+let isLlmOnline = false;
+
+// --- Reading Text Size Management ---
+function initTextSize() {
+    let saved = "medium";
+    try {
+        saved = localStorage.getItem("preferred-text-size") || "medium";
+    } catch (e) {}
+    setTextSize(saved);
+}
+
+function setTextSize(size) {
+    const validSizes = ["small", "medium", "large"];
+    if (!validSizes.includes(size)) size = "medium";
+
+    document.documentElement.setAttribute("data-text-size", size);
+    try {
+        localStorage.setItem("preferred-text-size", size);
+    } catch (e) {}
+
+    document.querySelectorAll(".size-pill").forEach(btn => {
+        btn.classList.toggle("active", btn.getAttribute("data-size") === size);
+    });
+}
+
 // --- Status Loading ---
 async function loadStatus() {
     try {
@@ -104,12 +133,149 @@ async function loadStatus() {
         document.getElementById("stat-docs").innerText = data.total_documents || 0;
         document.getElementById("stat-chunks").innerText = data.total_chunks || 0;
         document.getElementById("stat-words").innerText = (data.total_words || 0).toLocaleString();
+
+        if (data.llm) {
+            isLlmOnline = data.llm.available;
+            activeLlmModel = data.llm.active_model || "gemma4:12b";
+
+            const statLlm = document.getElementById("stat-llm");
+            if (statLlm) {
+                statLlm.innerText = isLlmOnline ? activeLlmModel : "Offline";
+                statLlm.style.color = isLlmOnline ? "var(--success)" : "var(--warning)";
+            }
+
+            const currentModelTag = document.getElementById("current-model-tag");
+            if (currentModelTag) currentModelTag.innerText = activeLlmModel;
+
+            const chipPulse = document.getElementById("chip-pulse");
+            const chipText = document.getElementById("llm-status-text");
+            if (chipText) {
+                chipText.innerText = isLlmOnline ? `Ollama Ready (${activeLlmModel})` : "Ollama Offline (Using Rule Engine)";
+            }
+            if (chipPulse) {
+                chipPulse.className = isLlmOnline ? "pulse-emerald" : "pulse-amber";
+            }
+
+            // Populate header model selector
+            const selectEl = document.getElementById("header-model-select");
+            if (selectEl && data.llm.models && data.llm.models.length > 0) {
+                selectEl.innerHTML = data.llm.models.map(m => `
+                    <option value="${escapeHtml(m)}" ${m === activeLlmModel ? "selected" : ""}>
+                        ${escapeHtml(m)}
+                    </option>
+                `).join("");
+            }
+        }
     } catch (err) {
         console.error("Failed to load status:", err);
     }
 }
 
-// --- Chat Assistant ---
+let deepThinkingEnabled = false;
+
+function handleLlmToggle(checked) {
+    const labelText = document.getElementById("toggle-label-text");
+    const deepWrap = document.getElementById("thinking-mode-wrap");
+    if (labelText) {
+        if (checked) {
+            labelText.innerHTML = `🤖 Ollama LLM: <strong id="current-model-tag">${escapeHtml(activeLlmModel)}</strong>`;
+            if (deepWrap) deepWrap.style.display = "inline-flex";
+        } else {
+            labelText.innerHTML = `⚡ Rule-Based Deterministic Engine`;
+            if (deepWrap) deepWrap.style.display = "none";
+        }
+    }
+}
+
+function handleDeepThinkToggle(checked) {
+    deepThinkingEnabled = checked;
+    const label = document.getElementById("deep-think-label");
+    if (label) {
+        label.innerHTML = checked ? "🧠 Deep Reasoning" : "⚡ Turbo Direct";
+    }
+}
+
+function toggleThinkingBox(msgId) {
+    const box = document.getElementById(`think-${msgId}`);
+    if (box) {
+        box.classList.toggle("collapsed");
+    }
+}
+
+// --- Citation Processing & Deduplication Helpers ---
+function stripTrailingCitations(md) {
+    if (!md) return "";
+    let cleaned = md;
+    // Strip trailing markdown sections like:
+    // ### Primary Citations / ## Citations / ### Verified Citations / ### Sources
+    // along with all following bullet items
+    cleaned = cleaned.replace(
+        /(?:\r?\n)+\s*#{1,4}\s*(?:Primary\s+Citations?|Verified\s+Citations?|Citations?|Sources?|References?)\b[\s\S]*$/i,
+        ""
+    );
+    // Strip trailing single-line reference notes like:
+    // 📌 **Primary Citation:** ... / 💡 **Support Hub:** ...
+    cleaned = cleaned.replace(
+        /(?:\r?\n)+[-*_]{3,}\s*(?:\r?\n)+(?:[📌💡🔗]\s*)?\*{0,2}(?:Primary\s+Citation|Primary\s+Reference|Primary\s+Documentation\s+Hub|Support\s+Hub|Diagnostic\s+Reference|Reference)s?:\*{0,2}[\s\S]*$/i,
+        ""
+    );
+    cleaned = cleaned.replace(
+        /(?:\r?\n)+(?:[📌💡🔗]\s*)?\*{0,2}(?:Primary\s+Citation|Primary\s+Reference|Primary\s+Documentation\s+Hub|Support\s+Hub|Diagnostic\s+Reference|Reference)s?:\*{0,2}[\s\S]*$/i,
+        ""
+    );
+    return cleaned.trim();
+}
+
+function deduplicateCitations(citations) {
+    if (!citations || !citations.length) return [];
+    const seen = new Set();
+    const result = [];
+    for (const c of citations) {
+        const url = (c.url || "").trim().toLowerCase();
+        const sec = (c.section || "").trim().toLowerCase();
+        const key = `${url}::${sec}`;
+        if (!seen.has(key)) {
+            seen.add(key);
+            result.push(c);
+        }
+    }
+    return result;
+}
+
+function formatCitationLabel(c) {
+    const title = (c.title || "Document").trim();
+    let sec = (c.section || "").trim();
+
+    // If section starts with or duplicates title, strip redundant prefix
+    if (sec.toLowerCase().startsWith(title.toLowerCase())) {
+        sec = sec.substring(title.length).replace(/^[\s>:\-–—]+/, "").trim();
+    }
+    if (sec) {
+        return `${title} (${sec})`;
+    }
+    return title;
+}
+
+function renderCitationsContent(citations) {
+    const deduped = deduplicateCitations(citations);
+    if (!deduped.length) return "";
+    return `
+        <span class="citations-header">VERIFIED CITATIONS:</span>
+        ${deduped.map(c => {
+            const label = formatCitationLabel(c);
+            const url = c.url || "#";
+            const fullTooltip = `${c.title || ''} (${c.section || ''})`.trim();
+            return `
+                <a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" class="citation-link" title="${escapeHtml(fullTooltip)}">
+                    <span class="citation-icon">🔗</span>
+                    <span class="citation-text">${escapeHtml(label)}</span>
+                </a>
+            `;
+        }).join("")}
+    `;
+}
+
+// --- Real-Time Streaming Chat Assistant ---
 async function handleChatSubmit(e) {
     e.preventDefault();
     const input = document.getElementById("chat-input");
@@ -119,20 +285,288 @@ async function handleChatSubmit(e) {
     appendMessage("user", query);
     input.value = "";
 
-    const loadingId = appendLoadingMessage();
+    const toggleEl = document.getElementById("toggle-llm");
+    const useLlm = toggleEl ? toggleEl.checked : true;
+    const modelSelect = document.getElementById("header-model-select");
+    const model = modelSelect ? modelSelect.value : activeLlmModel;
+
+    // Create live assistant message element
+    const container = document.getElementById("chat-messages");
+    const msgId = "msg-" + Date.now();
+    const msgDiv = document.createElement("div");
+    msgDiv.className = "message assistant-msg";
+    msgDiv.id = msgId;
+
+    const initialBadge = useLlm
+        ? `<div class="msg-engine-badge" id="engine-badge-${msgId}">
+             <span class="engine-icon">🦙</span>
+             <span>Synthesizing with <strong>${escapeHtml(model)}</strong> (Ollama)</span>
+             <span class="badge-tag">${deepThinkingEnabled ? "Deep Reasoning" : "Turbo Direct"}</span>
+             <span class="badge-stopwatch" id="stopwatch-${msgId}">0.0s</span>
+           </div>`
+        : `<div class="msg-engine-badge rule-based" id="engine-badge-${msgId}">
+             <span class="engine-icon">⚡</span>
+             <span>Deterministic Rule Engine</span>
+             <span class="badge-tag">Grounded Heuristic</span>
+             <span class="badge-stopwatch" id="stopwatch-${msgId}">0.0s</span>
+           </div>`;
+
+    msgDiv.innerHTML = `
+        <div class="avatar">🤖</div>
+        <div class="msg-body">
+            ${initialBadge}
+
+            <!-- Live Status Progress Strip -->
+            <div class="live-status-strip" id="status-strip-${msgId}">
+                <span class="live-pulse-dot"></span>
+                <span class="live-status-text" id="status-text-${msgId}">Analyzing query & decomposing search angles...</span>
+                <span class="live-timer-chip" id="timer-chip-${msgId}">0.0s</span>
+            </div>
+
+            <!-- Expandable Live Thinking Process Card -->
+            <div class="thinking-box" id="think-${msgId}" style="display: none;">
+                <div class="thinking-header" onclick="toggleThinkingBox('${msgId}')">
+                    <span class="think-icon">💭</span>
+                    <span class="think-title" id="think-title-${msgId}">Thinking Process</span>
+                    <span class="think-timer-badge" id="think-timer-${msgId}">0.0s</span>
+                    <span class="think-chevron">▾</span>
+                </div>
+                <div class="thinking-body markdown-thinking" id="think-body-${msgId}"></div>
+            </div>
+
+            <!-- Main Grounded Response Content Area -->
+            <div class="markdown-content" id="content-${msgId}">
+                <span class="streaming-dot-pulse"></span>
+            </div>
+
+            <!-- Verified Citations Card -->
+            <div class="citations-box" id="citations-${msgId}" style="display: none;"></div>
+
+            <!-- Execution Pipeline Accordion -->
+            <div id="steps-${msgId}" style="display: none;"></div>
+        </div>
+    `;
+
+    container.appendChild(msgDiv);
+    container.scrollTop = container.scrollHeight;
+
+    // Start live stopwatch timer
+    const tStart = performance.now();
+    const timerInterval = setInterval(() => {
+        const elapsedSec = ((performance.now() - tStart) / 1000).toFixed(1) + "s";
+        const swEl = document.getElementById(`stopwatch-${msgId}`);
+        const chipEl = document.getElementById(`timer-chip-${msgId}`);
+        if (swEl) swEl.innerText = elapsedSec;
+        if (chipEl) chipEl.innerText = elapsedSec;
+    }, 100);
+
+    let accumulatedContent = "";
+    let accumulatedThinking = "";
+    let steps = [];
+    let thinkingStarted = false;
+    let thinkingEnded = false;
 
     try {
-        const data = await safeFetchJson(`${API_BASE}/api/chat`, {
+        const response = await fetch(`${API_BASE}/api/chat/stream`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: query, top_k: 6 })
+            body: JSON.stringify({
+                message: query,
+                top_k: 4,
+                use_llm: useLlm,
+                model: model,
+                think: deepThinkingEnabled,
+            }),
         });
-        removeLoadingMessage(loadingId);
-        appendAssistantMessage(data.reply, data.citations, data.llm_prompt);
-        loadStatus();
+
+        if (!response.ok) {
+            throw new Error(`Server returned HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n\n");
+            buffer = lines.pop(); // Keep partial line in buffer
+
+            for (const block of lines) {
+                const line = block.trim();
+                if (!line.startsWith("data: ")) continue;
+
+                let event;
+                try {
+                    event = JSON.parse(line.substring(6));
+                } catch (e) {
+                    continue;
+                }
+
+                const evType = event.type;
+
+                if (evType === "step") {
+                    const statusText = document.getElementById(`status-text-${msgId}`);
+                    if (statusText) statusText.innerText = event.message || event.step?.action;
+                    if (event.step) steps.push(event.step);
+                } else if (evType === "synthesis_start") {
+                    const statusText = document.getElementById(`status-text-${msgId}`);
+                    if (statusText) {
+                        statusText.innerText = event.think
+                            ? `Reasoning & synthesizing with ${escapeHtml(event.model)}...`
+                            : `Synthesizing grounded response with ${escapeHtml(event.model)}...`;
+                    }
+                } else if (evType === "thinking_token") {
+                    if (!thinkingStarted) {
+                        thinkingStarted = true;
+                        const thinkBox = document.getElementById(`think-${msgId}`);
+                        if (thinkBox) thinkBox.style.display = "block";
+                        const statusStrip = document.getElementById(`status-strip-${msgId}`);
+                        if (statusStrip) statusStrip.style.display = "none";
+                    }
+                    accumulatedThinking += event.text;
+                    const thinkBody = document.getElementById(`think-body-${msgId}`);
+                    if (thinkBody) {
+                        thinkBody.innerHTML = (typeof marked !== "undefined") ? marked.parse(accumulatedThinking) : escapeHtml(accumulatedThinking);
+                    }
+                    const thinkTimer = document.getElementById(`think-timer-${msgId}`);
+                    if (thinkTimer && event.elapsed_ms) {
+                        thinkTimer.innerText = (event.elapsed_ms / 1000).toFixed(1) + "s";
+                    }
+                    container.scrollTop = container.scrollHeight;
+                } else if (evType === "thinking_end") {
+                    thinkingEnded = true;
+                    const thinkBox = document.getElementById(`think-${msgId}`);
+                    if (thinkBox) {
+                        thinkBox.classList.add("completed");
+                        thinkBox.classList.add("collapsed");
+                    }
+                    const thinkTitle = document.getElementById(`think-title-${msgId}`);
+                    if (thinkTitle) {
+                        const dur = ((event.duration_ms || 0) / 1000).toFixed(1);
+                        thinkTitle.innerHTML = `Thought for <strong>${dur}s</strong>`;
+                    }
+                    const thinkTimer = document.getElementById(`think-timer-${msgId}`);
+                    if (thinkTimer) thinkTimer.style.display = "none";
+                } else if (evType === "content_token") {
+                    // Hide status strip once content streaming begins
+                    const statusStrip = document.getElementById(`status-strip-${msgId}`);
+                    if (statusStrip) statusStrip.style.display = "none";
+
+                    accumulatedContent += event.text;
+                    const contentEl = document.getElementById(`content-${msgId}`);
+                    if (contentEl) {
+                        const cleanMd = stripTrailingCitations(accumulatedContent);
+                        const parsed = (typeof marked !== "undefined") ? marked.parse(cleanMd) : escapeHtml(cleanMd);
+                        contentEl.innerHTML = parsed + '<span class="typing-cursor"></span>';
+                    }
+                    container.scrollTop = container.scrollHeight;
+                } else if (evType === "citations") {
+                    const citationsBox = document.getElementById(`citations-${msgId}`);
+                    if (citationsBox && event.citations && event.citations.length > 0) {
+                        const content = renderCitationsContent(event.citations);
+                        if (content) {
+                            citationsBox.innerHTML = content;
+                            citationsBox.style.display = "flex";
+                        }
+                    }
+                } else if (evType === "done") {
+                    clearInterval(timerInterval);
+
+                    // Finalize content with trailing citations cleanly stripped
+                    const contentEl = document.getElementById(`content-${msgId}`);
+                    if (contentEl) {
+                        const rawMd = accumulatedContent || event.reply || "";
+                        const finalMd = stripTrailingCitations(rawMd);
+                        contentEl.innerHTML = (typeof marked !== "undefined") ? marked.parse(finalMd) : escapeHtml(finalMd);
+                    }
+
+                    // Render steps accordion if available
+                    const finalSteps = event.steps || steps;
+                    const stepsBox = document.getElementById(`steps-${msgId}`);
+                    if (stepsBox && finalSteps.length > 0) {
+                        stepsBox.style.display = "block";
+                        stepsBox.innerHTML = `
+                            <details class="reasoning-accordion">
+                                <summary>
+                                    <span class="trace-icon">⚡</span>
+                                    <span>Multi-Stage Agent Pipeline (${finalSteps.length} stages)</span>
+                                </summary>
+                                <div class="trace-content">
+                                    <ul class="trace-steps-list">
+                                        ${finalSteps.map(s => `
+                                            <li class="trace-step-item">
+                                                <span class="trace-step-agent">${escapeHtml(s.agent_name)}</span>
+                                                <span class="trace-step-action">${escapeHtml(s.action)}</span>
+                                                <span class="trace-step-latency">${s.latency_ms ? s.latency_ms.toFixed(1) + 'ms' : ''}</span>
+                                            </li>
+                                        `).join("")}
+                                    </ul>
+                                </div>
+                            </details>
+                        `;
+                    }
+
+                    // Finalize Badge with complete Timing & Speed Metrics
+                    const meta = event.meta || {};
+                    const badgeEl = document.getElementById(`engine-badge-${msgId}`);
+                    if (badgeEl) {
+                        const totalSec = (meta.latency_ms ? meta.latency_ms / 1000 : (performance.now() - tStart) / 1000).toFixed(1);
+                        const synthSec = (meta.synthesis_ms ? meta.synthesis_ms / 1000 : totalSec).toFixed(1);
+                        const thinkSec = meta.thinking_ms ? (meta.thinking_ms / 1000).toFixed(1) : "0.0";
+                        const tokPerSec = meta.tok_per_sec ? `${meta.tok_per_sec} tok/s` : "";
+                        const tokensCount = meta.eval_count ? `${meta.eval_count} tokens` : "";
+
+                        let timingMetricHtml = "";
+                        if (parseFloat(thinkSec) > 0) {
+                            timingMetricHtml = `<span class="badge-timing">🧠 Thought for ${thinkSec}s • Synthesized in ${synthSec}s ${tokPerSec ? '(' + tokPerSec + ')' : ''}</span>`;
+                        } else {
+                            timingMetricHtml = `<span class="badge-timing">⚡ Synthesized in ${synthSec}s ${tokPerSec ? '(' + tokPerSec + ')' : ''}</span>`;
+                        }
+
+                        if (meta.engine && meta.engine.startsWith("ollama")) {
+                            const modelTag = meta.model || model;
+                            badgeEl.className = "msg-engine-badge";
+                            badgeEl.innerHTML = `
+                                <span class="engine-icon">🦙</span>
+                                <span>Synthesized by <strong>${escapeHtml(modelTag)}</strong> (Ollama)</span>
+                                <span class="badge-tag">Zero Hallucination</span>
+                                ${timingMetricHtml}
+                                ${tokensCount ? `<span class="badge-tokens">${tokensCount}</span>` : ""}
+                            `;
+                        } else {
+                            badgeEl.className = "msg-engine-badge rule-based";
+                            badgeEl.innerHTML = `
+                                <span class="engine-icon">⚡</span>
+                                <span>Deterministic Rule Engine</span>
+                                <span class="badge-tag">Grounded Heuristic</span>
+                                ${timingMetricHtml}
+                            `;
+                        }
+                    }
+
+                    container.scrollTop = container.scrollHeight;
+                    loadStatus();
+                } else if (evType === "error") {
+                    clearInterval(timerInterval);
+                    const contentEl = document.getElementById(`content-${msgId}`);
+                    if (contentEl) {
+                        contentEl.innerHTML = `<div class="error-box">⚠️ ${escapeHtml(event.error)}</div>`;
+                    }
+                }
+            }
+        }
     } catch (err) {
-        removeLoadingMessage(loadingId);
-        appendMessage("assistant", "⚠️ Error communicating with local knowledge assistant: " + err.message);
+        clearInterval(timerInterval);
+        const statusStrip = document.getElementById(`status-strip-${msgId}`);
+        if (statusStrip) statusStrip.style.display = "none";
+        const contentEl = document.getElementById(`content-${msgId}`);
+        if (contentEl) {
+            contentEl.innerHTML = `<div class="error-box">⚠️ Error communicating with knowledge assistant: ${escapeHtml(err.message)}</div>`;
+        }
     }
 }
 
@@ -156,39 +590,88 @@ function appendMessage(role, text) {
     container.scrollTop = container.scrollHeight;
 }
 
-function appendAssistantMessage(replyMarkdown, citations, promptText) {
+function appendAssistantMessage(replyMarkdown, citations, steps, meta = {}) {
     const container = document.getElementById("chat-messages");
     const msgDiv = document.createElement("div");
     msgDiv.className = "message assistant-msg";
 
-    const parsedHtml = (typeof marked !== "undefined") ? marked.parse(replyMarkdown) : replyMarkdown;
+    const cleanedMd = stripTrailingCitations(replyMarkdown);
+    const parsedHtml = (typeof marked !== "undefined") ? marked.parse(cleanedMd) : escapeHtml(cleanedMd);
 
+    // Engine badge pill
+    let engineBadgeHtml = "";
+    if (meta.engine && meta.engine.startsWith("ollama")) {
+        const modelName = meta.model || activeLlmModel;
+        const tokenBadge = meta.eval_count ? `<span class="badge-tokens">${meta.eval_count} tokens</span>` : "";
+        engineBadgeHtml = `
+            <div class="msg-engine-badge">
+                <span class="engine-icon">🦙</span>
+                <span>Synthesized by <strong>${escapeHtml(modelName)}</strong> (Ollama)</span>
+                <span class="badge-tag">Zero Hallucination</span>
+                ${tokenBadge}
+            </div>
+        `;
+    } else {
+        engineBadgeHtml = `
+            <div class="msg-engine-badge rule-based">
+                <span class="engine-icon">⚡</span>
+                <span>Deterministic Rule Engine</span>
+                <span class="badge-tag">Grounded Heuristic</span>
+            </div>
+        `;
+    }
+
+    // Citations (industry standard bottom pills, deduplicated, 5-6pt text)
     let citationsHtml = "";
     if (citations && citations.length > 0) {
-        citationsHtml = `
-            <div class="citations-box">
-                <div class="citations-header">Sources & Citations:</div>
-                ${citations.map(c => `
-                    <a href="${escapeHtml(c.url)}" target="_blank" rel="noopener noreferrer" class="citation-link">
-                        <span>🔗 ${escapeHtml(c.title)} (${escapeHtml(c.section)})</span>
-                    </a>
-                `).join("")}
-            </div>
+        const inner = renderCitationsContent(citations);
+        if (inner) {
+            citationsHtml = `
+                <div class="citations-box">
+                    ${inner}
+                </div>
+            `;
+        }
+    }
+
+    // Expandable Multi-Stage Agent Execution Steps
+    let stepsHtml = "";
+    if (steps && steps.length > 0) {
+        stepsHtml = `
+            <details class="reasoning-accordion">
+                <summary>
+                    <span class="trace-icon">⚡</span>
+                    <span>Multi-Stage Agent Pipeline (${steps.length} stages)</span>
+                </summary>
+                <div class="trace-content">
+                    <ul class="trace-steps-list">
+                        ${steps.map(s => `
+                            <li class="trace-step-item">
+                                <span class="trace-step-agent">${escapeHtml(s.agent_name)}</span>
+                                <span class="trace-step-action">${escapeHtml(s.action)}</span>
+                                <span class="trace-step-latency">${s.latency_ms ? s.latency_ms.toFixed(1) + 'ms' : ''}</span>
+                            </li>
+                        `).join("")}
+                    </ul>
+                </div>
+            </details>
         `;
     }
 
     msgDiv.innerHTML = `
         <div class="avatar">🤖</div>
         <div class="msg-body">
+            ${engineBadgeHtml}
             <div class="markdown-content">${parsedHtml}</div>
             ${citationsHtml}
+            ${stepsHtml}
         </div>
     `;
     container.appendChild(msgDiv);
     container.scrollTop = container.scrollHeight;
 }
 
-function appendLoadingMessage() {
+function appendLoadingMessage(text = "Searching local knowledge base...") {
     const container = document.getElementById("chat-messages");
     const id = "loading-" + Date.now();
     const msgDiv = document.createElement("div");
@@ -197,7 +680,7 @@ function appendLoadingMessage() {
     msgDiv.innerHTML = `
         <div class="avatar">🤖</div>
         <div class="msg-body" style="color: var(--text-dim);">
-            <div class="loading-dots">Searching local knowledge base...</div>
+            <div class="loading-dots">${escapeHtml(text)}</div>
         </div>
     `;
     container.appendChild(msgDiv);
@@ -291,11 +774,22 @@ async function loadSources() {
 
         grid.innerHTML = "";
         docs.forEach(doc => {
+            const isPdf = (doc.url && doc.url.toLowerCase().endsWith(".pdf")) ||
+                          (doc.url && doc.url.toLowerCase().includes(".pdf")) ||
+                          (doc.description && doc.description.includes("PDF"));
+
+            const typeBadge = isPdf 
+                ? `<span class="badge-score" style="background: rgba(239, 68, 68, 0.15); color: #f87171; border-color: rgba(239, 68, 68, 0.3);">📄 PDF</span>`
+                : `<span class="badge-score" style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; border-color: rgba(56, 189, 248, 0.3);">🌐 Web</span>`;
+
             const card = document.createElement("div");
             card.className = "source-card";
             card.innerHTML = `
                 <div>
-                    <h4>${escapeHtml(doc.headline || doc.title)}</h4>
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 6px;">
+                        <h4 style="margin: 0;">${escapeHtml(doc.headline || doc.title)}</h4>
+                        ${typeBadge}
+                    </div>
                     <p class="source-desc">${escapeHtml(doc.description || "Technical documentation")}</p>
                 </div>
                 <div>
@@ -357,12 +851,19 @@ async function deleteDoc(encodedUrl) {
     }
 }
 
-// --- Ingest URLs ---
+// --- Ingest URLs & Presets ---
 function setBitbucketPreset() {
     document.getElementById("ingest-urls-textarea").value = [
         "https://support.atlassian.com/bitbucket-cloud/docs/what-is-a-workspace/",
         "https://support.atlassian.com/bitbucket-cloud/docs/create-your-workspace/",
         "https://support.atlassian.com/bitbucket-cloud/docs/grant-access-to-a-workspace/"
+    ].join("\n");
+}
+
+function setEsgPreset() {
+    document.getElementById("ingest-urls-textarea").value = [
+        "https://www.pwc.com/sk/en/environmental-social-and-corporate-governance-esg/esg-reporting.html",
+        "https://www.sustainabilityreports.com/services/esg-data"
     ].join("\n");
 }
 
@@ -405,6 +906,106 @@ async function submitIngest() {
     } finally {
         btn.disabled = false;
     }
+}
+
+// --- PDF & File Ingestion ---
+function handleFileSelect(files) {
+    if (!files || files.length === 0) return;
+    const file = files[0];
+    uploadPdfDocument(file);
+}
+
+async function uploadPdfDocument(file) {
+    if (!file) return;
+
+    const progressBox = document.getElementById("file-upload-progress");
+    const nameEl = document.getElementById("upload-filename");
+    const badgeEl = document.getElementById("upload-status-badge");
+    const fillEl = document.getElementById("upload-progress-bar");
+    const msgEl = document.getElementById("upload-result-msg");
+
+    if (progressBox) progressBox.style.display = "block";
+    if (nameEl) nameEl.innerText = `${file.name} (${(file.size / 1024).toFixed(1)} KB)`;
+    if (badgeEl) {
+        badgeEl.className = "badge-status";
+        badgeEl.innerText = "Extracting & Indexing...";
+    }
+    if (fillEl) fillEl.style.width = "45%";
+    if (msgEl) {
+        msgEl.className = "upload-result-msg";
+        msgEl.innerText = "Extracting pages, parsing tables, and generating semantic chunks...";
+    }
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const resp = await fetch(`${API_BASE}/api/ingest/file`, {
+            method: "POST",
+            body: formData,
+        });
+
+        const data = await resp.json();
+
+        if (!resp.ok) {
+            throw new Error(data.detail || `HTTP ${resp.status}`);
+        }
+
+        if (fillEl) fillEl.style.width = "100%";
+        if (badgeEl) {
+            badgeEl.className = "badge-status success";
+            badgeEl.innerText = "Indexed";
+        }
+        if (msgEl) {
+            msgEl.className = "upload-result-msg success";
+            msgEl.innerHTML = `✅ Successfully ingested <strong>${escapeHtml(data.headline)}</strong>: ${data.chunks} chunks created (${data.word_count} words).`;
+        }
+
+        loadStatus();
+        loadSources();
+    } catch (err) {
+        if (fillEl) fillEl.style.width = "100%";
+        if (badgeEl) {
+            badgeEl.className = "badge-status error";
+            badgeEl.innerText = "Failed";
+        }
+        if (msgEl) {
+            msgEl.className = "upload-result-msg error";
+            msgEl.innerText = `❌ Error indexing document: ${err.message}`;
+        }
+    }
+}
+
+function setupDropZone() {
+    const dropZone = document.getElementById("pdf-drop-zone");
+    if (!dropZone) return;
+
+    ["dragenter", "dragover"].forEach(eventName => {
+        dropZone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropZone.classList.add("dragover");
+        }, false);
+    });
+
+    ["dragleave", "drop"].forEach(eventName => {
+        dropZone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropZone.classList.remove("dragover");
+        }, false);
+    });
+
+    dropZone.addEventListener("drop", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.classList.remove("dragover");
+        const dt = e.dataTransfer;
+        const files = dt.files;
+        if (files && files.length > 0) {
+            uploadPdfDocument(files[0]);
+        }
+    }, false);
 }
 
 // --- Activity & MCP Logs ---

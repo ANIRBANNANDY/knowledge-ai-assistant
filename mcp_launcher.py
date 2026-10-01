@@ -11,8 +11,8 @@ Usage in mcp_config.json:
 import os
 import sys
 
-# Project root = parent directory of this script
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Project root = directory containing this script
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # Add project root to Python path for src.* imports
 if PROJECT_ROOT not in sys.path:

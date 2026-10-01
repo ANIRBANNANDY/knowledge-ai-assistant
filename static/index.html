@@ -7,8 +7,7 @@
     <meta name="description" content="Local Zero-API-Key Knowledge AI Chatbot powered by Hybrid RAG & Gemini 3.7 Flash">
     <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;450;500;600;700&family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <!-- Markdown Parser -->
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <link rel="stylesheet" href="style.css">
@@ -55,7 +54,7 @@
                         <line x1="12" y1="5" x2="12" y2="19"/>
                         <line x1="5" y1="12" x2="19" y2="12"/>
                     </svg>
-                    <span>Ingest URLs</span>
+                    <span>Ingest Web & PDFs</span>
                 </button>
                 <button class="nav-item" id="tab-btn-logs" data-tab="logs">
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -80,12 +79,17 @@
                         <span class="label">Words:</span>
                         <strong id="stat-words" class="val">-</strong>
                     </div>
+                    <div class="stats-row">
+                        <span class="label">Local LLM:</span>
+                        <strong id="stat-llm" class="val val-highlight">gemma4:12b</strong>
+                    </div>
                     <div class="status-indicator">
                         <span class="status-dot"></span>
-                        <span class="status-text">MCP & RAG Active</span>
+                        <span class="status-text" id="stat-status-text">Ollama & RAG Active</span>
                     </div>
                 </div>
             </div>
+
         </aside>
 
         <!-- Main Content Area -->
@@ -97,9 +101,24 @@
                     <p id="page-desc">Ask questions grounded in your local Atlassian Bitbucket Cloud knowledge base</p>
                 </div>
                 <div class="header-right">
+                    <div class="text-size-control" title="Adjust Reading Text Size (S / M / L)">
+                        <span class="text-size-label">Aa</span>
+                        <div class="text-size-pills">
+                            <button type="button" class="size-pill" data-size="small" onclick="setTextSize('small')" title="Compact (Small)">S</button>
+                            <button type="button" class="size-pill active" data-size="medium" onclick="setTextSize('medium')" title="Comfortable (Default)">M</button>
+                            <button type="button" class="size-pill" data-size="large" onclick="setTextSize('large')" title="Enlarged (Large)">L</button>
+                        </div>
+                    </div>
+                    <div class="llm-pill" id="llm-pill">
+                        <span class="status-dot-llm" id="llm-dot"></span>
+                        <span class="engine-label">Ollama LLM:</span>
+                        <select id="header-model-select" class="model-select-inline" onchange="switchModel(this.value)" title="Switch Active Ollama Model">
+                            <option value="gemma4:12b">gemma4:12b</option>
+                        </select>
+                    </div>
                     <div class="model-badge">
                         <span class="pulse-ring"></span>
-                        <span class="engine-label">MCP Server:</span>
+                        <span class="engine-label">MCP:</span>
                         <strong>Active (stdio)</strong>
                     </div>
                 </div>
@@ -113,7 +132,7 @@
                             <div class="avatar">🤖</div>
                             <div class="msg-body">
                                 <h3>Welcome to your Grounded Knowledge AI!</h3>
-                                <p>All answers are strictly grounded in your indexed documentation with zero hallucination. Try these questions:</p>
+                                <p>Grounded in your indexed documentation and synthesized by your local <strong>gemma4:12b</strong> LLM via Ollama with zero hallucination. Try these questions:</p>
                                 <div class="quick-questions">
                                     <button class="chip" onclick="askPreset('What is a Bitbucket workspace?')">What is a workspace?</button>
                                     <button class="chip" onclick="askPreset('What happens if I change my workspace ID?')">Changing Workspace ID</button>
@@ -121,6 +140,28 @@
                                     <button class="chip" onclick="askPreset('Who can invite users and grant access?')">User Invitations & Access</button>
                                 </div>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Chat Controls Bar: LLM Engine Switcher & Status -->
+                    <div class="chat-controls-bar">
+                        <div class="engine-toggle-wrap">
+                            <label class="switch-control" title="Toggle between Local Ollama LLM and Deterministic Rule-Based synthesis">
+                                <input type="checkbox" id="toggle-llm" checked onchange="handleLlmToggle(this.checked)">
+                                <span class="switch-track"></span>
+                                <span class="switch-label" id="toggle-label-text">🤖 Ollama LLM: <strong id="current-model-tag">gemma4:12b</strong></span>
+                            </label>
+                        </div>
+                        <div class="thinking-mode-wrap" id="thinking-mode-wrap">
+                            <label class="switch-control" title="Toggle Thinking Mode: Turbo Direct (fastest ~2-5s grounded synthesis) vs Deep Reasoning (streams model's internal thinking steps)">
+                                <input type="checkbox" id="toggle-deep-think" onchange="handleDeepThinkToggle(this.checked)">
+                                <span class="switch-track"></span>
+                                <span class="switch-label" id="deep-think-label">⚡ Turbo Direct</span>
+                            </label>
+                        </div>
+                        <div class="llm-chip-indicator" id="llm-chip-indicator">
+                            <span class="pulse-emerald" id="chip-pulse"></span>
+                            <span id="llm-status-text">Ollama Ready (Local GPU)</span>
                         </div>
                     </div>
 
@@ -144,6 +185,7 @@
                     </div>
                 </div>
             </section>
+
 
             <!-- TAB 2: HYBRID SEARCH & EXPLORER -->
             <section class="tab-pane" id="pane-search">
@@ -205,22 +247,71 @@
                 </div>
             </section>
 
-            <!-- TAB 4: INGEST URLS -->
+            <!-- TAB 4: INGEST WEB & PDFS -->
             <section class="tab-pane" id="pane-ingest">
                 <div class="ingest-panel">
+                    <!-- PDF Document Upload Card -->
+                    <div class="ingest-card pdf-upload-card">
+                        <div class="card-title-row">
+                            <div class="card-icon-badge pdf-badge">📄 PDF</div>
+                            <div>
+                                <h3>Upload & Index PDF Documents</h3>
+                                <p>Upload local ESG reports, technical manuals, or whitepapers. PyMuPDF extracts page numbers, headings, structured tables, and indexes them into hybrid RAG search.</p>
+                            </div>
+                        </div>
+
+                        <div class="drop-zone" id="pdf-drop-zone" onclick="document.getElementById('pdf-file-input').click()">
+                            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                                <line x1="12" y1="18" x2="12" y2="12"/>
+                                <polyline points="9 15 12 12 15 15"/>
+                            </svg>
+                            <div class="drop-zone-text">
+                                <strong>Choose a PDF file</strong> or drag & drop it here
+                            </div>
+                            <span class="drop-zone-hint">Supports .PDF, .TXT, .MD (up to 50MB)</span>
+                            <input 
+                                type="file" 
+                                id="pdf-file-input" 
+                                accept=".pdf,.txt,.md" 
+                                style="display:none;" 
+                                onchange="handleFileSelect(this.files)"
+                            />
+                        </div>
+
+                        <div id="file-upload-progress" class="upload-progress-box" style="display:none;">
+                            <div class="upload-progress-info">
+                                <span id="upload-filename">document.pdf</span>
+                                <span id="upload-status-badge" class="badge-status">Processing...</span>
+                            </div>
+                            <div class="progress-bar-track">
+                                <div class="progress-bar-fill" id="upload-progress-bar"></div>
+                            </div>
+                            <div class="upload-result-msg" id="upload-result-msg"></div>
+                        </div>
+                    </div>
+
+                    <!-- Web & PDF URLs Ingest Card -->
                     <div class="ingest-card">
-                        <h3>Scrape & Index Web Documentation</h3>
-                        <p>Enter URLs (one per line). The scraper will automatically fetch content, clean headings, extract JSON-LD schemas, generate overlapping chunks, and update the hybrid search index.</p>
+                        <div class="card-title-row">
+                            <div class="card-icon-badge web-badge">🌐 URL</div>
+                            <div>
+                                <h3>Scrape & Index Web Documentation & PDF Links</h3>
+                                <p>Enter URLs (one per line). The scraper automatically fetches content, bypasses WAF/Cloudflare, extracts JSON-LD schemas, parses online PDF links, and updates the search index.</p>
+                            </div>
+                        </div>
 
                         <div class="quick-presets">
                             <span class="preset-label">Quick Presets:</span>
-                            <button class="btn btn-xs btn-outline" onclick="setBitbucketPreset()">Fill Default 3 Bitbucket URLs</button>
+                            <button class="btn btn-xs btn-outline" onclick="setBitbucketPreset()">Bitbucket Cloud Docs</button>
+                            <button class="btn btn-xs btn-outline" onclick="setEsgPreset()">PwC & ESG Documentation</button>
                         </div>
 
                         <textarea 
                             id="ingest-urls-textarea" 
-                            rows="6" 
-                            placeholder="https://support.atlassian.com/bitbucket-cloud/docs/what-is-a-workspace/&#10;https://support.atlassian.com/bitbucket-cloud/docs/create-your-workspace/&#10;https://support.atlassian.com/bitbucket-cloud/docs/grant-access-to-a-workspace/"
+                            rows="5" 
+                            placeholder="https://support.atlassian.com/bitbucket-cloud/docs/what-is-a-workspace/&#10;https://www.pwc.com/sk/en/environmental-social-and-corporate-governance-esg/esg-reporting.html&#10;https://www.sustainabilityreports.com/services/esg-data"
                         ></textarea>
 
                         <div class="ingest-actions">

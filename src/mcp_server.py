@@ -20,6 +20,7 @@ if PROJECT_ROOT not in sys.path:
 
 from src.agent import KnowledgeQueryAgent
 from src.chunker import DocumentChunker
+from src.llm import LocalLLMClient
 from src.logger import log_event
 from src.retriever import KnowledgeRetriever
 from src.scraper import WebScraper
@@ -42,13 +43,17 @@ class KnowledgeMCPServer:
         self.scraper = WebScraper()
         self.chunker = DocumentChunker()
         self.retriever = KnowledgeRetriever(self.storage)
-        self.agent = KnowledgeQueryAgent(retriever=self.retriever, storage=self.storage)
+        self.llm_client = LocalLLMClient()
+        self.agent = KnowledgeQueryAgent(
+            retriever=self.retriever, storage=self.storage, llm_client=self.llm_client
+        )
         log_event(
             category="MCP",
             event_type="SERVER_START",
-            action="MCP Server Initialized",
-            details={"db_path": abs_db},
+            action="MCP Server Initialized with Local LLM",
+            details={"db_path": abs_db, "llm_model": self.llm_client.default_model},
         )
+
 
     def get_tools_list(self) -> List[Dict[str, Any]]:
         return [
@@ -75,8 +80,25 @@ class KnowledgeMCPServer:
                             "description": "Number of evidence chunks to analyze (default 6).",
                             "default": 6,
                         },
+                        "use_llm": {
+                            "type": "boolean",
+                            "description": "Whether to use local Ollama LLM for grounded answer synthesis (default true).",
+                            "default": True,
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Specific Ollama model to use (default: gemma4:12b).",
+                        },
                     },
                     "required": ["query"],
+                },
+            },
+            {
+                "name": "get_llm_status",
+                "description": "Inspect local Ollama LLM server health, connection status, active model, and available models.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {},
                 },
             },
             {
@@ -145,20 +167,39 @@ class KnowledgeMCPServer:
     def handle_tool_call(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         t0 = time.time()
         try:
-            if name == "query_knowledge_agent":
+            if name == "get_llm_status":
+                health = self.llm_client.check_health()
+                elapsed_ms = (time.time() - t0) * 1000
+                log_event(
+                    category="MCP",
+                    event_type="TOOL_CALL_EXECUTED",
+                    action="Agent checked local LLM status",
+                    details=health,
+                    latency_ms=elapsed_ms,
+                )
+                return {
+                    "content": [{"type": "text", "text": json.dumps(health, indent=2)}],
+                    "isError": False,
+                }
+
+            elif name == "query_knowledge_agent":
                 query = arguments.get("query", "")
                 top_k = int(arguments.get("top_k", 6))
-                agent_resp = self.agent.answer_query(query, top_k=top_k)
+                use_llm = arguments.get("use_llm", True)
+                model = arguments.get("model", None)
+                agent_resp = self.agent.answer_query(query, top_k=top_k, use_llm=use_llm, model=model)
                 elapsed_ms = (time.time() - t0) * 1000
 
                 log_event(
                     category="MCP",
                     event_type="TOOL_CALL_EXECUTED",
-                    action=f"Agent executed 'query_knowledge_agent' for '{query[:50]}'",
+                    action=f"Agent executed 'query_knowledge_agent' ({agent_resp.engine}) for '{query[:50]}'",
                     details={
                         "tool": name,
                         "query": query,
                         "intent": agent_resp.intent,
+                        "engine": agent_resp.engine,
+                        "model": agent_resp.model,
                         "evidence_count": agent_resp.evidence_count,
                         "unindexed": agent_resp.unindexed,
                     },
@@ -169,6 +210,7 @@ class KnowledgeMCPServer:
                     "content": [{"type": "text", "text": agent_resp.reply}],
                     "isError": False,
                 }
+
 
             elif name == "search_knowledge_base":
                 query = arguments.get("query", "")

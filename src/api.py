@@ -5,14 +5,15 @@ and real-time activity/MCP process logging.
 """
 
 from __future__ import annotations
+import json
 import os
 import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, HttpUrl
 
@@ -35,15 +36,16 @@ if PROJECT_ROOT not in sys.path:
 
 from src.agent import KnowledgeQueryAgent
 from src.chunker import DocumentChunker
+from src.llm import LocalLLMClient
 from src.logger import clear_logs, get_recent_logs, log_event
 from src.retriever import KnowledgeRetriever
-from src.scraper import WebScraper
+from src.scraper import WebScraper, parse_pdf_bytes, parse_text_or_markdown
 from src.storage import KnowledgeStorage
 
 app = FastAPI(
     title="Knowledge AI Chatbot API",
     description="Local RAG & Knowledge Retrieval for Documentation with Process Logging",
-    version="1.2.0",
+    version="1.3.0",
 )
 
 # Global Exception Handler to ensure JSON responses on errors
@@ -82,7 +84,8 @@ storage = KnowledgeStorage(os.path.join(PROJECT_ROOT, "data/knowledge_base.db"))
 scraper = WebScraper()
 chunker = DocumentChunker()
 retriever = KnowledgeRetriever(storage)
-knowledge_agent = KnowledgeQueryAgent(retriever=retriever, storage=storage)
+llm_client = LocalLLMClient()
+knowledge_agent = KnowledgeQueryAgent(retriever=retriever, storage=storage, llm_client=llm_client)
 
 
 # --- Request/Response Models ---
@@ -98,6 +101,16 @@ class SearchRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str
     top_k: int = 6
+    use_llm: bool = True
+    model: Optional[str] = None
+    think: bool = False
+
+
+class LLMConfigRequest(BaseModel):
+    enabled: Optional[bool] = None
+    model: Optional[str] = None
+    temperature: Optional[float] = None
+    timeout: Optional[float] = None
 
 
 @app.get("/api/status")
@@ -105,13 +118,42 @@ def get_status():
     docs = storage.list_documents()
     total_chunks = sum(d.get("chunk_count", 0) for d in docs)
     total_words = sum(d.get("word_count", 0) for d in docs)
+    llm_health = llm_client.check_health()
     return {
         "status": "online",
         "total_documents": len(docs),
         "total_chunks": total_chunks,
         "total_words": total_words,
-        "model_integration": "Dedicated Multi-Stage Knowledge Query Agent",
+        "model_integration": "Multi-Stage Knowledge Agent + Local Ollama LLM",
+        "llm": llm_health,
     }
+
+
+@app.get("/api/llm/status")
+def get_llm_status():
+    return llm_client.check_health()
+
+
+@app.get("/api/llm/models")
+def get_llm_models():
+    return {"models": llm_client.list_models(), "active_model": llm_client.default_model}
+
+
+@app.post("/api/llm/config")
+def update_llm_config(req: LLMConfigRequest):
+    if req.enabled is not None:
+        llm_client.enabled = req.enabled
+    if req.model is not None:
+        llm_client.set_active_model(req.model)
+    if req.temperature is not None:
+        llm_client.temperature = req.temperature
+    if req.timeout is not None:
+        llm_client.timeout = req.timeout
+    return {
+        "status": "updated",
+        "health": llm_client.check_health(),
+    }
+
 
 
 @app.get("/api/documents")
@@ -164,6 +206,68 @@ def ingest_urls(req: IngestRequest):
     return {"results": results}
 
 
+@app.post("/api/ingest/file")
+async def ingest_file(file: UploadFile = File(...)):
+    """
+    Ingest local PDF, Markdown, or text files directly into the knowledge base.
+    Extracts text, preserves page numbers/headers, chunks semantically, and indexes in SQLite + FTS5.
+    """
+    t0 = time.time()
+    filename = file.filename or "uploaded_document"
+    contents = await file.read()
+
+    if not contents:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        # 1. Detect if file is PDF
+        if filename.lower().endswith(".pdf") or contents.startswith(b"%PDF-"):
+            doc = parse_pdf_bytes(contents, source_identifier=filename)
+        else:
+            text_str = contents.decode("utf-8", errors="replace")
+            doc = parse_text_or_markdown(text_str, source_identifier=filename)
+
+        # 2. Chunk semantically
+        chunks = chunker.chunk_document(doc)
+
+        # 3. Store in SQLite & FTS5
+        storage.save_document_and_chunks(doc, chunks)
+        retriever.invalidate_vocab_cache()
+
+        elapsed_ms = (time.time() - t0) * 1000
+        log_event(
+            category="WEB",
+            event_type="FILE_INGEST",
+            action=f"User ingested file '{filename}'",
+            details={
+                "filename": filename,
+                "bytes": len(contents),
+                "chunks": len(chunks),
+                "words": doc.word_count,
+            },
+            latency_ms=elapsed_ms,
+        )
+
+        return {
+            "status": "success",
+            "filename": filename,
+            "title": doc.title,
+            "headline": doc.headline,
+            "chunks": len(chunks),
+            "word_count": doc.word_count,
+            "message": f"Successfully ingested '{doc.headline}' with {len(chunks)} chunks ({doc.word_count} words).",
+        }
+    except Exception as e:
+        log_event(
+            category="WEB",
+            event_type="FILE_INGEST_ERROR",
+            action=f"Failed to ingest file '{filename}': {str(e)}",
+            details={"filename": filename, "error": str(e)},
+            status="error",
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to process file '{filename}': {str(e)}")
+
+
 @app.delete("/api/documents")
 def delete_document(url: str = Query(..., description="Document URL to delete")):
     deleted = storage.delete_document(url)
@@ -213,16 +317,24 @@ def chat_with_knowledge(req: ChatRequest):
 
     t0 = time.time()
     try:
-        agent_response = knowledge_agent.answer_query(query, top_k=req.top_k)
+        agent_response = knowledge_agent.answer_query(
+            query,
+            top_k=req.top_k,
+            use_llm=req.use_llm,
+            model=req.model,
+            think=req.think,
+        )
         elapsed_ms = (time.time() - t0) * 1000
 
         log_event(
             category="WEB",
             event_type="WEB_CHAT",
-            action=f"Chat answered by Knowledge Agent: '{query[:50]}'",
+            action=f"Chat answered by Knowledge Agent ({agent_response.engine}): '{query[:50]}'",
             details={
                 "query": query,
                 "intent": agent_response.intent,
+                "engine": agent_response.engine,
+                "model": agent_response.model,
                 "evidence_count": agent_response.evidence_count,
                 "unindexed": agent_response.unindexed,
             },
@@ -238,7 +350,12 @@ def chat_with_knowledge(req: ChatRequest):
             "steps": [s.model_dump() for s in agent_response.steps],
             "hits": agent_response.hits,
             "unindexed": agent_response.unindexed,
+            "engine": agent_response.engine,
+            "model": agent_response.model,
+            "eval_count": agent_response.eval_count,
+            "prompt_eval_count": agent_response.prompt_eval_count,
         }
+
     except Exception as e:
         elapsed_ms = (time.time() - t0) * 1000
         log_event(
@@ -250,6 +367,41 @@ def chat_with_knowledge(req: ChatRequest):
             latency_ms=elapsed_ms,
         )
         raise HTTPException(status_code=500, detail=f"Failed to process chat query: {str(e)}")
+
+
+@app.post("/api/chat/stream")
+def chat_stream(req: ChatRequest):
+    """
+    Server-Sent Events (SSE) streaming endpoint for real-time grounded generation,
+    progressive agent reasoning traces, and live token delivery.
+    """
+    query = req.message.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    def event_generator():
+        try:
+            for event in knowledge_agent.stream_query(
+                query=query,
+                top_k=req.top_k,
+                use_llm=req.use_llm,
+                model=req.model,
+                think=req.think,
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception as e:
+            err_payload = {"type": "error", "error": str(e)}
+            yield f"data: {json.dumps(err_payload)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # --- Process & Activity Logs Endpoints ---

@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import html as html_lib
 import json
+import os
 import re
 import time
 import unicodedata
@@ -15,6 +16,12 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 import httpx
 from lxml import html, etree
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
 
 from src.logger import log_event
 
@@ -46,8 +53,156 @@ def clean_unicode(text: str) -> str:
     return "\n".join(lines)
 
 
+def parse_pdf_bytes(
+    pdf_bytes: bytes,
+    source_identifier: str = "document.pdf",
+    title_override: Optional[str] = None,
+) -> ScrapedDocument:
+    """
+    High-fidelity PDF document extractor.
+    Extracts text, page boundaries, headings, tables, and metadata from PDF bytes.
+    Preserves hierarchical breadcrumbs per page for precise RAG citations.
+    """
+    t0 = time.time()
+    title = title_override or ""
+    author = ""
+    page_texts: List[tuple[int, str]] = []
+    total_pages = 0
+
+    # 1. Primary extractor: PyMuPDF (fitz) - ultra-fast & preserves tables
+    try:
+        import fitz
+        doc_fitz = fitz.open(stream=pdf_bytes, filetype="pdf")
+        meta = doc_fitz.metadata or {}
+        if not title and meta.get("title"):
+            title = clean_unicode(meta.get("title"))
+        if meta.get("author"):
+            author = clean_unicode(meta.get("author"))
+
+        total_pages = len(doc_fitz)
+
+        for idx in range(total_pages):
+            page_num = idx + 1
+            page = doc_fitz[idx]
+
+            # Extract any structured tables on page
+            tables_md: List[str] = []
+            try:
+                tabs = page.find_tables()
+                if tabs and tabs.tables:
+                    for t in tabs.tables:
+                        df_rows = t.extract()
+                        if df_rows and len(df_rows) > 0:
+                            headers = [clean_unicode(str(c or "").strip()) for c in df_rows[0]]
+                            if any(headers):
+                                table_lines = ["| " + " | ".join(headers) + " |"]
+                                table_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+                                for r in df_rows[1:]:
+                                    cells = [clean_unicode(str(c or "").strip()).replace("|", "\\|") for c in r]
+                                    table_lines.append("| " + " | ".join(cells) + " |")
+                                tables_md.append("\n".join(table_lines))
+            except Exception:
+                pass
+
+            page_text = clean_unicode(page.get_text("text").strip())
+
+            combined_page = []
+            if page_text:
+                combined_page.append(page_text)
+            if tables_md:
+                combined_page.extend(tables_md)
+
+            if combined_page:
+                page_texts.append((page_num, "\n\n".join(combined_page)))
+
+        doc_fitz.close()
+    except Exception as e_fitz:
+        # 2. Fallback extractor: pypdf
+        try:
+            from io import BytesIO
+            from pypdf import PdfReader
+            reader = PdfReader(BytesIO(pdf_bytes))
+            if not title and reader.metadata and reader.metadata.title:
+                title = clean_unicode(reader.metadata.title)
+            total_pages = len(reader.pages)
+            for idx, p in enumerate(reader.pages):
+                txt = clean_unicode(p.extract_text() or "").strip()
+                if txt:
+                    page_texts.append((idx + 1, txt))
+        except Exception as e_pypdf:
+            raise ValueError(f"Failed to parse PDF bytes: PyMuPDF ({e_fitz}), pypdf fallback ({e_pypdf})")
+
+    # Generate clean human-readable title if missing from metadata
+    if not title:
+        base_name = os.path.basename(source_identifier.split("?")[0].replace("\\", "/"))
+        name_without_ext = re.sub(r"\.pdf$", "", base_name, flags=re.IGNORECASE)
+        title = " ".join(re.split(r"[-_]+", name_without_ext)).strip().title()
+        if not title:
+            title = "PDF Document"
+
+    headline = title
+    desc_str = f"PDF document ({total_pages} page(s), {len(page_texts)} indexed)"
+    if author:
+        desc_str += f" | Author: {author}"
+
+    md_parts = [f"# {headline}\n\n", f"> **Source:** `{source_identifier}` | **Summary:** {desc_str}\n\n"]
+    for p_num, text in page_texts:
+        md_parts.append(f"## Page {p_num}\n\n{text}\n\n")
+
+    full_markdown = clean_unicode("".join(md_parts))
+    raw_text = clean_unicode(" ".join(full_markdown.split()))
+    word_count = len(raw_text.split())
+
+    elapsed_ms = (time.time() - t0) * 1000
+    log_event(
+        category="SCRAPER",
+        event_type="PDF_PARSED",
+        action=f"Parsed PDF '{headline}' ({total_pages} pages)",
+        details={
+            "source": source_identifier,
+            "pages": total_pages,
+            "word_count": word_count,
+            "bytes": len(pdf_bytes),
+        },
+        latency_ms=elapsed_ms,
+    )
+
+    return ScrapedDocument(
+        url=source_identifier,
+        title=title,
+        headline=headline,
+        description=desc_str,
+        markdown_content=full_markdown,
+        raw_text=raw_text,
+        breadcrumbs=[title, f"Pages 1-{total_pages}"],
+        word_count=word_count,
+    )
+
+
+def parse_text_or_markdown(text: str, source_identifier: str = "document.txt") -> ScrapedDocument:
+    """Parse plain text or Markdown file into a ScrapedDocument."""
+    clean_text_content = clean_unicode(text)
+    base_name = os.path.basename(source_identifier.split("?")[0].replace("\\", "/"))
+    title = os.path.splitext(base_name)[0].replace("_", " ").replace("-", " ").title()
+    if not title:
+        title = "Text Document"
+
+    full_md = f"# {title}\n\n> **Source:** `{source_identifier}`\n\n{clean_text_content}"
+    raw_text = clean_unicode(" ".join(clean_text_content.split()))
+    return ScrapedDocument(
+        url=source_identifier,
+        title=title,
+        headline=title,
+        description=f"Uploaded text document ({len(raw_text.split())} words)",
+        markdown_content=full_md,
+        raw_text=raw_text,
+        breadcrumbs=[title],
+        word_count=len(raw_text.split()),
+    )
+
+
 class WebScraper:
-    def __init__(self, timeout: float = 20.0):
+    def __init__(self, timeout: float = 25.0):
         self.timeout = timeout
         self.headers = {
             "User-Agent": (
@@ -55,24 +210,74 @@ class WebScraper:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
         }
 
-    def fetch_url(self, url: str) -> str:
+    def fetch_raw(self, url: str) -> tuple[bytes, str]:
+        """
+        Fetch raw bytes and content-type using browser impersonation (curl_cffi)
+        with graceful fallback to httpx.
+        """
         t0 = time.time()
-        with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
-            resp = client.get(url, headers=self.headers)
-            resp.raise_for_status()
-            elapsed_ms = (time.time() - t0) * 1000
-            log_event(
-                category="SCRAPER",
-                event_type="HTTP_FETCH",
-                action=f"Fetched {url}",
-                details={"status_code": resp.status_code, "bytes": len(resp.content)},
-                latency_ms=elapsed_ms,
-            )
-            return resp.text
+        last_error = None
+
+        # 1. Try curl_cffi with Chrome impersonation
+        if HAS_CURL_CFFI:
+            try:
+                resp = curl_requests.get(
+                    url,
+                    headers=self.headers,
+                    impersonate="chrome124",
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                )
+                resp.raise_for_status()
+                ctype = resp.headers.get("content-type", "")
+                elapsed_ms = (time.time() - t0) * 1000
+                log_event(
+                    category="SCRAPER",
+                    event_type="HTTP_FETCH",
+                    action=f"Fetched raw {url} via curl_cffi (Chrome impersonated)",
+                    details={"status_code": resp.status_code, "bytes": len(resp.content), "content_type": ctype},
+                    latency_ms=elapsed_ms,
+                )
+                return resp.content, ctype
+            except Exception as e:
+                last_error = e
+
+        # 2. Fallback to standard httpx client
+        try:
+            with httpx.Client(timeout=self.timeout, follow_redirects=True) as client:
+                resp = client.get(url, headers=self.headers)
+                resp.raise_for_status()
+                ctype = resp.headers.get("content-type", "")
+                elapsed_ms = (time.time() - t0) * 1000
+                log_event(
+                    category="SCRAPER",
+                    event_type="HTTP_FETCH",
+                    action=f"Fetched raw {url} via httpx",
+                    details={"status_code": resp.status_code, "bytes": len(resp.content), "content_type": ctype},
+                    latency_ms=elapsed_ms,
+                )
+                return resp.content, ctype
+        except Exception as e:
+            if last_error:
+                raise last_error from e
+            raise e
+
+    def fetch_url(self, url: str) -> str:
+        """Fetch HTML/plain text string from a URL."""
+        content, _ = self.fetch_raw(url)
+        return content.decode("utf-8", errors="replace")
 
     def parse_html_to_markdown(self, element) -> str:
         """Convert lxml html element to clean markdown representation."""
@@ -80,15 +285,15 @@ class WebScraper:
             return ""
 
         # Remove noise elements
-        for tag in ["script", "style", "noscript", "svg", "nav", "footer", "iframe", "button"]:
+        for tag in ["script", "style", "noscript", "svg", "nav", "footer", "header", "iframe", "button"]:
             for el in element.xpath(f".//{tag}"):
                 parent = el.getparent()
                 if parent is not None:
                     parent.remove(el)
 
-        # Remove sidebars, feedback forms, and table of contents
+        # Remove sidebars, navigation bars, feedback forms, modals, cookie notices, and table of contents
         for el in element.xpath(
-            './/*[contains(@class, "sidebar") or contains(@class, "toc") or contains(@class, "table-of-contents") or contains(@class, "feedback")]'
+            './/*[contains(@class, "sidebar") or contains(@class, "toc") or contains(@class, "table-of-contents") or contains(@class, "feedback") or contains(@class, "slide-nav") or contains(@class, "slimnav") or contains(@class, "slimheader") or contains(@class, "cookie") or contains(@class, "modal")]'
         ):
             parent = el.getparent()
             if parent is not None:
@@ -177,9 +382,32 @@ class WebScraper:
         return cleaned_md
 
     def scrape(self, url: str) -> ScrapedDocument:
-        """Fetch and parse documentation from a given URL."""
+        """
+        Fetch and parse documentation from a given URL or file path.
+        Seamlessly supports HTML documentation pages, remote PDF URLs, and local files.
+        """
         t0 = time.time()
-        html_content = self.fetch_url(url)
+        url = url.strip()
+
+        # 1. Handle local file paths (direct path or file:// URI)
+        local_path = url[7:] if url.startswith("file://") else url
+        if os.path.isfile(local_path):
+            with open(local_path, "rb") as f:
+                content_bytes = f.read()
+            if local_path.lower().endswith(".pdf") or content_bytes.startswith(b"%PDF-"):
+                return parse_pdf_bytes(content_bytes, source_identifier=url)
+            else:
+                return parse_text_or_markdown(content_bytes.decode("utf-8", errors="replace"), source_identifier=url)
+
+        # 2. Remote URL: fetch raw bytes and inspect content-type
+        content_bytes, ctype = self.fetch_raw(url)
+
+        # 3. Check if remote content is PDF
+        if url.lower().split("?")[0].endswith(".pdf") or "application/pdf" in ctype.lower() or content_bytes.startswith(b"%PDF-"):
+            return parse_pdf_bytes(content_bytes, source_identifier=url)
+
+        # 4. Parse as HTML
+        html_content = content_bytes.decode("utf-8", errors="replace")
         tree = html.fromstring(html_content)
 
         # 1. Extract metadata from Title & Meta tags
@@ -228,7 +456,7 @@ class WebScraper:
 
         # 3. Locate Main Content Container by priority
         main_candidates = tree.xpath(
-            '//article[@id="maincontent"] | //div[contains(@class, "ak-renderer-document")] | //div[contains(@class, "topic__body")] | //article | //main'
+            '//article[@id="maincontent"] | //div[contains(@class, "ak-renderer-document")] | //div[contains(@class, "topic__body")] | //main | //article | //*[@role="main"] | //div[@id="main-content"] | //div[@id="content"]'
         )
         main_element = main_candidates[0] if main_candidates else tree.xpath("//body")[0]
 

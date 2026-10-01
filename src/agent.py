@@ -15,10 +15,11 @@ from __future__ import annotations
 import collections
 import re
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple
 from pydantic import BaseModel, Field
 
 from src.logger import log_event
+from src.llm import LocalLLMClient
 from src.retriever import KnowledgeRetriever, SearchHit
 from src.storage import KnowledgeStorage
 
@@ -42,18 +43,29 @@ class AgentResponse(BaseModel):
     is_grounded: bool = True
     unindexed: bool = False
     decomposed_queries: List[str] = Field(default_factory=list)
+    engine: str = "rule-based"
+    model: Optional[str] = None
+    eval_count: Optional[int] = None
+    prompt_eval_count: Optional[int] = None
 
 
 class KnowledgeQueryAgent:
     """
     Dedicated Multi-Stage Knowledge Query Agent orchestrating query decomposition,
     intent classification, multi-angle evidence retrieval, citation verification,
-    and structured factual synthesis without any external LLM dependency.
+    and structured factual synthesis via Local LLM (Ollama) with deterministic fallback.
     """
 
-    def __init__(self, retriever: KnowledgeRetriever, storage: KnowledgeStorage):
+    def __init__(
+        self,
+        retriever: KnowledgeRetriever,
+        storage: KnowledgeStorage,
+        llm_client: Optional[LocalLLMClient] = None,
+    ):
         self.retriever = retriever
         self.storage = storage
+        self.llm_client = llm_client or LocalLLMClient()
+
 
     def decompose_query(self, query: str) -> List[str]:
         """
@@ -222,7 +234,6 @@ class KnowledgeQueryAgent:
         output = [
             f"## 📌 Definition: {query.strip('?').title()}\n\n",
             f"> {definition_text}\n\n",
-            f"📌 **Primary Citation:** [{top_hit.doc_title}]({top_hit.doc_url}) (`{top_hit.section_path}`)\n\n",
             "---\n\n",
         ]
 
@@ -285,8 +296,6 @@ class KnowledgeQueryAgent:
             "Based on the indexed documentation, here is what occurs as a consequence:\n\n",
             "---\n\n",
             "\n---\n\n".join(consequence_blocks),
-            "\n\n---\n",
-            f"📌 **Primary Reference:** [{top_hit.doc_title}]({top_hit.doc_url}) (`{top_hit.section_path}`)\n",
         ]
 
         steps.append(
@@ -332,8 +341,6 @@ class KnowledgeQueryAgent:
             "Here is the verified execution procedure from the authoritative documentation:\n\n",
             "---\n\n",
             "\n---\n\n".join(sections_blocks),
-            "\n\n---\n",
-            f"💡 **Primary Documentation Hub:** [{top_hit.doc_title}]({top_hit.doc_url})\n",
         ]
 
         steps.append(
@@ -371,8 +378,6 @@ class KnowledgeQueryAgent:
             "Based on the indexed documentation, here is the direct breakdown of differences:\n\n",
             "---\n\n",
             "\n---\n\n".join(comparison_blocks),
-            "\n\n---\n",
-            f"📌 **Primary Reference:** [{top_hit.doc_title}]({top_hit.doc_url}) (`{top_hit.section_path}`)\n",
         ]
 
         steps.append(
@@ -410,8 +415,6 @@ class KnowledgeQueryAgent:
             "Authoritative resolution steps identified from the documentation:\n\n",
             "---\n\n",
             "\n---\n\n".join(resolution_blocks),
-            "\n\n---\n",
-            f"💡 **Support Hub:** [{top_hit.doc_title}]({top_hit.doc_url})\n",
         ]
 
         steps.append(
@@ -505,8 +508,6 @@ class KnowledgeQueryAgent:
             f"Synthesized from indexed technical documentation for: **\"{query}\"**\n\n",
             "---\n\n",
             "\n---\n\n".join(sections_blocks),
-            "\n\n---\n",
-            f"📌 **Primary Citation:** [{top_hit.doc_title}]({top_hit.doc_url}) (`{top_hit.section_path}`)\n",
         ]
 
         steps.append(
@@ -521,14 +522,40 @@ class KnowledgeQueryAgent:
 
         return "".join(output)
 
-    def answer_query(self, query: str, top_k: int = 6) -> AgentResponse:
+    def _synthesize_by_intent(
+        self, intent: str, query: str, final_hits: List[SearchHit], steps: List[AgentStep]
+    ) -> str:
+        """Helper to invoke the appropriate deterministic heuristic synthesis method."""
+        if intent == "DEFINITION":
+            return self._synthesize_definition(query, final_hits, steps)
+        elif intent == "CONTEXTUAL":
+            return self._synthesize_contextual(query, final_hits, steps)
+        elif intent == "WORKFLOW":
+            return self._synthesize_workflow(query, final_hits, steps)
+        elif intent == "COMPARISON":
+            return self._synthesize_comparison(query, final_hits, steps)
+        elif intent == "TROUBLESHOOTING":
+            return self._synthesize_troubleshooting(query, final_hits, steps)
+        elif intent == "BENEFITS":
+            return self._synthesize_benefits(query, final_hits, steps)
+        else:
+            return self._synthesize_general(query, final_hits, steps)
+
+    def answer_query(
+        self,
+        query: str,
+        top_k: int = 6,
+        use_llm: bool = True,
+        model: Optional[str] = None,
+        think: bool = False,
+    ) -> AgentResponse:
         """
         Main Agent Execution Pipeline:
         1. Query Decomposition (Compound query handling)
         2. Query Intent Analysis
         3. Multi-Angle Evidence Retrieval via Hybrid RRF
         4. Anti-Hallucination Guardrail Check
-        5. Intent-Specific Grounded Synthesis
+        5. Grounded Synthesis via Local LLM (Ollama) with Rule-Based Fallback
         """
         t_start = time.time()
         steps: List[AgentStep] = []
@@ -632,23 +659,58 @@ class KnowledgeQueryAgent:
                 is_grounded=True,
                 unindexed=True,
                 decomposed_queries=decomposed,
+                engine="rule-based",
             )
 
-        # Stage 5: Intent-Specific Grounded Synthesis
-        if intent == "DEFINITION":
-            reply_text = self._synthesize_definition(query, final_hits, steps)
-        elif intent == "CONTEXTUAL":
-            reply_text = self._synthesize_contextual(query, final_hits, steps)
-        elif intent == "WORKFLOW":
-            reply_text = self._synthesize_workflow(query, final_hits, steps)
-        elif intent == "COMPARISON":
-            reply_text = self._synthesize_comparison(query, final_hits, steps)
-        elif intent == "TROUBLESHOOTING":
-            reply_text = self._synthesize_troubleshooting(query, final_hits, steps)
-        elif intent == "BENEFITS":
-            reply_text = self._synthesize_benefits(query, final_hits, steps)
+        # Stage 5: Grounded Synthesis (Local LLM with Deterministic Fallback)
+        engine = "rule-based"
+        active_model = None
+        eval_count = None
+        prompt_eval_count = None
+
+        if use_llm and self.llm_client and self.llm_client.enabled:
+            try:
+                llm_res = self.llm_client.synthesize_answer(
+                    query=query,
+                    intent=intent,
+                    hits=final_hits,
+                    model=model,
+                    think=think,
+                )
+                reply_text = llm_res.get("text", "").strip()
+                if not reply_text or len(reply_text) < 25:
+                    raise RuntimeError(f"LLM generated insufficient output ({len(reply_text)} chars)")
+                engine = llm_res.get("engine", "ollama")
+                active_model = llm_res.get("model")
+                eval_count = llm_res.get("eval_count")
+                prompt_eval_count = llm_res.get("prompt_eval_count")
+
+                steps.append(
+                    AgentStep(
+                        agent_name=f"LocalLLMAgent ({active_model})",
+                        action=f"Synthesized grounded {intent.lower()} response via Ollama Local LLM",
+                        status="success",
+                        details={
+                            "model": active_model,
+                            "eval_tokens": eval_count,
+                            "prompt_tokens": prompt_eval_count,
+                        },
+                        latency_ms=llm_res.get("latency_ms", 0.0),
+                    )
+                )
+            except Exception as e:
+                steps.append(
+                    AgentStep(
+                        agent_name="DeterministicSynthesisAgent",
+                        action=f"Local LLM synthesis bypassed/failed ({str(e)[:65]}); fell back to rule-based synthesis",
+                        status="warning",
+                        details={"error": str(e)},
+                        latency_ms=0.0,
+                    )
+                )
+                reply_text = self._synthesize_by_intent(intent, query, final_hits, steps)
         else:
-            reply_text = self._synthesize_general(query, final_hits, steps)
+            reply_text = self._synthesize_by_intent(intent, query, final_hits, steps)
 
         # Add low-confidence caveat if top score is very low
         top_score = final_hits[0].score if final_hits else 0.0
@@ -673,10 +735,12 @@ class KnowledgeQueryAgent:
         log_event(
             category="AGENT",
             event_type="AGENT_QUERY_COMPLETED",
-            action=f"Knowledge Query Agent answered '{query[:50]}' ({intent})",
+            action=f"Knowledge Query Agent answered '{query[:50]}' ({intent}) [{engine}]",
             details={
                 "query": query,
                 "intent": intent,
+                "engine": engine,
+                "model": active_model,
                 "evidence_count": len(final_hits),
                 "steps_count": len(steps),
                 "decomposed_count": len(decomposed),
@@ -696,4 +760,287 @@ class KnowledgeQueryAgent:
             is_grounded=True,
             unindexed=False,
             decomposed_queries=decomposed,
+            engine=engine,
+            model=active_model,
+            eval_count=eval_count,
+            prompt_eval_count=prompt_eval_count,
         )
+
+    def stream_query(
+        self,
+        query: str,
+        top_k: int = 4,
+        use_llm: bool = True,
+        model: Optional[str] = None,
+        think: bool = False,
+    ) -> Generator[Dict[str, Any], None, None]:
+        """
+        Streaming Agent Execution Pipeline:
+        Yields real-time events for decomposition, intent classification, evidence retrieval,
+        live thinking tokens, streaming content tokens, and comprehensive completion metrics.
+        """
+        t_start = time.time()
+        steps: List[AgentStep] = []
+
+        # Stage 1: Query Decomposition
+        t0 = time.time()
+        decomposed = self.decompose_query(query)
+        step1 = AgentStep(
+            agent_name="QueryDecompositionAgent",
+            action=f"Decomposed query into {len(decomposed)} search angle(s)",
+            status="success",
+            details={"sub_queries": decomposed},
+            latency_ms=round((time.time() - t0) * 1000, 2),
+        )
+        steps.append(step1)
+        yield {
+            "type": "step",
+            "step": step1.model_dump(),
+            "stage": "decomposition",
+            "message": f"Decomposed query into {len(decomposed)} search angle(s)",
+            "elapsed_ms": round((time.time() - t_start) * 1000, 1),
+        }
+
+        # Stage 2: Intent Classification
+        t0 = time.time()
+        intent, facets = self.classify_intent(query)
+        step2 = AgentStep(
+            agent_name="QueryIntentAgent",
+            action=f"Classified intent as '{intent}' (Facets: {facets})",
+            status="success",
+            details={"intent": intent, "facets": facets},
+            latency_ms=round((time.time() - t0) * 1000, 2),
+        )
+        steps.append(step2)
+        yield {
+            "type": "step",
+            "step": step2.model_dump(),
+            "stage": "intent",
+            "intent": intent,
+            "message": f"Classified intent as '{intent}'",
+            "elapsed_ms": round((time.time() - t_start) * 1000, 1),
+        }
+
+        # Stage 3: Multi-Angle Evidence Retrieval
+        t0 = time.time()
+        aggregated_hits: Dict[str, SearchHit] = {}
+
+        for sub_q in decomposed:
+            hits = self.retriever.hybrid_search(sub_q, top_k=top_k)
+            for h in hits:
+                if h.chunk_id not in aggregated_hits:
+                    aggregated_hits[h.chunk_id] = h
+                else:
+                    aggregated_hits[h.chunk_id].score += h.score * 0.5
+
+        final_hits = sorted(
+            list(aggregated_hits.values()), key=lambda x: x.score, reverse=True
+        )[:top_k]
+
+        step3 = AgentStep(
+            agent_name="EvidenceRetrievalAgent",
+            action=f"Retrieved {len(final_hits)} verified evidence chunks across {len(decomposed)} angle(s)",
+            status="success" if final_hits else "warning",
+            details={
+                "total_candidates": len(aggregated_hits),
+                "selected_count": len(final_hits),
+                "top_section": final_hits[0].section_path if final_hits else None,
+                "top_score": final_hits[0].score if final_hits else 0.0,
+            },
+            latency_ms=round((time.time() - t0) * 1000, 2),
+        )
+        steps.append(step3)
+        yield {
+            "type": "step",
+            "step": step3.model_dump(),
+            "stage": "retrieval",
+            "message": f"Retrieved {len(final_hits)} verified chunks in {step3.latency_ms}ms",
+            "evidence_count": len(final_hits),
+            "elapsed_ms": round((time.time() - t_start) * 1000, 1),
+        }
+
+        # Stage 4: Anti-Hallucination Guardrail Check
+        if not final_hits:
+            docs = self.storage.list_documents()
+            available_topics = ", ".join([d.get("headline", d["title"]) for d in docs[:6]])
+            unindexed_msg = (
+                "### ❌ Topic Not Found in Knowledge Base\n\n"
+                f"The knowledge query agent searched the indexed documentation, but found **no verified information** for: **\"{query}\"**.\n\n"
+                f"**Available Indexed Topics ({len(docs)} Docs):**\n"
+                f"{available_topics or 'None'}\n\n"
+                "💡 *Use the **Ingest URLs** tab or CLI `python cli.py ingest <url>` to add relevant documentation for this topic.*"
+            )
+
+            step4 = AgentStep(
+                agent_name="AntiHallucinationGuard",
+                action="Zero verified hits detected: Protected against hallucination",
+                status="protected",
+                details={"query": query, "available_docs": len(docs)},
+                latency_ms=0.5,
+            )
+            steps.append(step4)
+            yield {
+                "type": "step",
+                "step": step4.model_dump(),
+                "stage": "guardrail",
+                "message": "Protected against hallucination (unindexed topic)",
+                "elapsed_ms": round((time.time() - t_start) * 1000, 1),
+            }
+            yield {"type": "content_token", "text": unindexed_msg}
+            yield {
+                "type": "done",
+                "reply": unindexed_msg,
+                "citations": [],
+                "steps": [s.model_dump() for s in steps],
+                "meta": {
+                    "engine": "rule-based",
+                    "latency_ms": round((time.time() - t_start) * 1000, 2),
+                    "intent": intent,
+                },
+            }
+            return
+
+        citations = [
+            {
+                "title": h.doc_title,
+                "url": h.doc_url,
+                "section": h.section_path,
+                "score": f"{h.score:.4f}",
+            }
+            for h in final_hits[:5]
+        ]
+        yield {"type": "citations", "citations": citations}
+
+        # Stage 5: Grounded Synthesis
+        engine = "rule-based"
+        active_model = None
+        eval_count = None
+        prompt_eval_count = None
+        tok_per_sec = None
+        thinking_ms = 0.0
+        synthesis_ms = 0.0
+        streamed_text = ""
+        stream_failed = False
+
+        if use_llm and self.llm_client and self.llm_client.enabled:
+            active_model = model or self.llm_client.default_model
+            yield {
+                "type": "synthesis_start",
+                "engine": f"ollama:{active_model}",
+                "model": active_model,
+                "think": bool(think),
+                "message": f"Synthesizing grounded answer with {active_model}...",
+                "elapsed_ms": round((time.time() - t_start) * 1000, 1),
+            }
+
+            try:
+                t_synth_start = time.time()
+                for chunk in self.llm_client.stream_synthesize_answer(
+                    query=query,
+                    intent=intent,
+                    hits=final_hits,
+                    model=model,
+                    think=think,
+                ):
+                    chunk_type = chunk.get("type")
+                    if chunk_type == "thinking_token":
+                        yield {
+                            "type": "thinking_token",
+                            "text": chunk.get("text", ""),
+                            "elapsed_ms": chunk.get("elapsed_ms", 0),
+                        }
+                    elif chunk_type == "thinking_end":
+                        thinking_ms = chunk.get("duration_ms", 0)
+                        yield {
+                            "type": "thinking_end",
+                            "duration_ms": thinking_ms,
+                            "text": chunk.get("text", ""),
+                        }
+                    elif chunk_type == "content_token":
+                        streamed_text += chunk.get("text", "")
+                        yield {
+                            "type": "content_token",
+                            "text": chunk.get("text", ""),
+                        }
+                    elif chunk_type == "metrics":
+                        engine = chunk.get("engine", f"ollama:{active_model}")
+                        eval_count = chunk.get("eval_count")
+                        prompt_eval_count = chunk.get("prompt_eval_count")
+                        tok_per_sec = chunk.get("tok_per_sec")
+                        thinking_ms = chunk.get("thinking_ms", thinking_ms)
+                        synthesis_ms = chunk.get("synthesis_ms", round((time.time() - t_synth_start) * 1000, 2))
+
+                step5 = AgentStep(
+                    agent_name=f"LocalLLMAgent ({active_model})",
+                    action=f"Synthesized grounded {intent.lower()} response via Ollama Local LLM",
+                    status="success",
+                    details={
+                        "model": active_model,
+                        "eval_tokens": eval_count,
+                        "prompt_tokens": prompt_eval_count,
+                        "thinking_ms": thinking_ms,
+                        "synthesis_ms": synthesis_ms,
+                        "tok_per_sec": tok_per_sec,
+                    },
+                    latency_ms=synthesis_ms,
+                )
+                steps.append(step5)
+                yield {
+                    "type": "step",
+                    "step": step5.model_dump(),
+                    "stage": "synthesis",
+                    "message": f"Synthesis complete ({eval_count} tokens, {tok_per_sec} tok/s)",
+                    "elapsed_ms": round((time.time() - t_start) * 1000, 1),
+                }
+
+            except Exception as e:
+                stream_failed = True
+                step5_fallback = AgentStep(
+                    agent_name="DeterministicSynthesisAgent",
+                    action=f"Local LLM streaming bypassed/failed ({str(e)[:65]}); fell back to rule-based synthesis",
+                    status="warning",
+                    details={"error": str(e)},
+                    latency_ms=0.0,
+                )
+                steps.append(step5_fallback)
+                yield {
+                    "type": "step",
+                    "step": step5_fallback.model_dump(),
+                    "stage": "fallback",
+                    "message": f"LLM error: {str(e)[:50]} - Falling back to Deterministic Rule Engine",
+                    "elapsed_ms": round((time.time() - t_start) * 1000, 1),
+                }
+
+        if not use_llm or stream_failed or not streamed_text:
+            # Deterministic synthesis
+            t_det_start = time.time()
+            reply_text = self._synthesize_by_intent(intent, query, final_hits, steps)
+            synthesis_ms = round((time.time() - t_det_start) * 1000, 2)
+            streamed_text = reply_text
+            engine = "rule-based"
+            # Stream in chunks for smooth UI rendering
+            words = reply_text.split(" ")
+            for i in range(0, len(words), 8):
+                part = " ".join(words[i : i + 8]) + " "
+                yield {"type": "content_token", "text": part}
+
+        total_elapsed = round((time.time() - t_start) * 1000, 2)
+        yield {
+            "type": "done",
+            "reply": streamed_text,
+            "citations": citations,
+            "steps": [s.model_dump() for s in steps],
+            "meta": {
+                "engine": engine,
+                "model": active_model,
+                "eval_count": eval_count,
+                "prompt_eval_count": prompt_eval_count,
+                "tok_per_sec": tok_per_sec,
+                "thinking_ms": thinking_ms,
+                "synthesis_ms": synthesis_ms,
+                "latency_ms": total_elapsed,
+                "intent": intent,
+            },
+        }
+
+

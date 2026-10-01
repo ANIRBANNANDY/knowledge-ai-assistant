@@ -55,12 +55,21 @@ def main():
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8000"))
 
+    from src.llm import LocalLLMClient
+    llm = LocalLLMClient()
+    health = llm.check_health()
+
     print("=" * 70)
     print("  [>] KNOWLEDGE AI CHATBOT SERVER STARTING")
     print(f"  [>] Web Dashboard: http://{host}:{port}")
     print(f"  [>] Swagger API Docs: http://{host}:{port}/docs")
-    print("  [>] Knowledge Agent: Dedicated Multi-Stage Agent Active")
+    if health.get("available"):
+        print(f"  [>] Local LLM (Ollama): ONLINE (Model: {health.get('active_model')})")
+    else:
+        print("  [!] Local LLM (Ollama): OFFLINE (Deterministic rule fallback active)")
+    print("  [>] Knowledge Agent: Multi-Stage Hybrid RAG Active")
     print("=" * 70 + "\n")
+
 
     uvicorn.run("src.api:app", host=host, port=port, reload=True)
 
