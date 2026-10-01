@@ -268,10 +268,22 @@ class LocalLLMClient:
 
         try:
             with httpx.Client(timeout=self.timeout) as client:
+                req_payload = dict(payload)
                 resp = client.post(
                     f"{self.base_url}/api/chat",
-                    json=payload,
+                    json=req_payload,
                 )
+
+                # Graceful handling for models that do not support thinking mode (e.g., qwen2.5vl)
+                if resp.status_code == 400 and req_payload.get("think") and "does not support thinking" in resp.text:
+                    log_event(
+                        category="LLM",
+                        event_type="OLLAMA_FALLBACK",
+                        action=f"Model '{target_model}' does not support thinking mode; retrying with direct synthesis",
+                        details={"model": target_model, "think": think},
+                    )
+                    req_payload["think"] = False
+                    resp = client.post(f"{self.base_url}/api/chat", json=req_payload)
 
                 # Fallback to /api/generate if /api/chat is not supported
                 if resp.status_code == 404:
@@ -295,7 +307,8 @@ class LocalLLMClient:
                     answer_text = data.get("response", "").strip()
                     thinking_text = ""
                 else:
-                    resp.raise_for_status()
+                    if resp.status_code >= 400:
+                        raise RuntimeError(f"Ollama returned HTTP {resp.status_code}: {resp.text}")
                     data = resp.json()
                     msg = data.get("message", {})
                     answer_text = msg.get("content", "").strip()
@@ -420,8 +433,31 @@ class LocalLLMClient:
 
         try:
             with httpx.Client(timeout=self.timeout) as client:
-                with client.stream("POST", f"{self.base_url}/api/chat", json=payload) as resp:
-                    resp.raise_for_status()
+                req_payload = dict(payload)
+                cm = client.stream("POST", f"{self.base_url}/api/chat", json=req_payload)
+                resp = cm.__enter__()
+
+                # Graceful handling: if model does not support thinking, auto-retry with direct streaming
+                if resp.status_code == 400 and req_payload.get("think"):
+                    err_msg = resp.read().decode("utf-8", errors="replace")
+                    if "does not support thinking" in err_msg:
+                        cm.__exit__(None, None, None)
+                        log_event(
+                            category="LLM",
+                            event_type="OLLAMA_FALLBACK",
+                            action=f"Model '{target_model}' does not support thinking mode; retrying with direct synthesis",
+                            details={"model": target_model, "think": think},
+                        )
+                        req_payload["think"] = False
+                        cm = client.stream("POST", f"{self.base_url}/api/chat", json=req_payload)
+                        resp = cm.__enter__()
+
+                if resp.status_code >= 400:
+                    err_msg = resp.read().decode("utf-8", errors="replace")
+                    cm.__exit__(None, None, None)
+                    raise RuntimeError(f"Ollama returned HTTP {resp.status_code}: {err_msg}")
+
+                try:
                     for line in resp.iter_lines():
                         if not line:
                             continue
@@ -458,6 +494,8 @@ class LocalLLMClient:
                             eval_count = chunk.get("eval_count", 0)
                             prompt_eval_count = chunk.get("prompt_eval_count", 0)
                             eval_dur_ns = chunk.get("eval_duration", 0) or 0
+                finally:
+                    cm.__exit__(None, None, None)
 
             # If thinking occurred but thinking_end was never sent (e.g. content was slow to start)
             if thinking_text and think_end is None:
